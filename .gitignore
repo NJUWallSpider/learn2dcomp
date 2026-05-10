@@ -1,0 +1,10 @@
+data/
+models/
+results/
+.vscode/
+__pycache__/
+*.log
+*.tmp
+.DS_Store
+*.pdf
+*.txt
