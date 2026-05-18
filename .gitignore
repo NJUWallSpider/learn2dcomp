@@ -1,0 +1,12 @@
+data/
+models/
+results/
+.vscode/
+__pycache__/
+*.log
+*.tmp
+Thumbs.db
+Desktop.ini
+venv/
+*.pdf
+*.txt

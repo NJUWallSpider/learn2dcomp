@@ -1,0 +1,22 @@
+sync:
+  code-sync:
+    alpha: ./          # 本地项目路径（当前目录）
+    beta: V100:/home/mip/learn2dcomp  # 服务器路径
+
+    # mode: one-way-safe   # ⭐ 推荐，避免误删服务器文件
+    mode: two-way-resolved
+
+    ignore:
+      vcs: true
+      paths:
+        - .git
+        - node_modules
+        - __pycache__
+        - .venv
+        - data
+        - models
+        - outputs
+        - "*.pt"
+        - "*.ckpt"
+        - "*.npy"
+        - .vscode
