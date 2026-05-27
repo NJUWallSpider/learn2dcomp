@@ -2,6 +2,7 @@ import torch
 from torch_geometric.loader import DataLoader
 import numpy as np
 from sklearn.metrics import adjusted_rand_score, v_measure_score, normalized_mutual_info_score
+from sklearn.cluster import DBSCAN
 import config
 from data_process import MILPDataset, add_laplacian_pe
 from gnn_model import GraphTransformer
@@ -169,8 +170,8 @@ def test():
                         acc = (linking_pred[linking_mask] == linking_true[linking_mask]).mean()
                         metrics['con_linking_acc'].append(float(acc))
 
-                    # Block accuracy (on LOCAL constraints only)
-                    local_mask = con_true >= 0
+                    # Block accuracy (on LOCAL/block constraints: label >= 1)
+                    local_mask = con_true >= 1
                     if local_mask.sum() > 0:
                         block_pred = con_block_logits.argmax(dim=1).cpu().numpy()
                         block_true = con_true[local_mask]
@@ -204,10 +205,11 @@ def test():
                 min_samples = config.EVAL_PARAMS.get('dbscan_min_samples', 2)
 
                 try:
-                    pred_labels, eps_values = utilities.hierarchical_dbscan(
-                        val_embeddings,
-                        min_samples=min_samples
-                    )
+                    # Simple DBSCAN with knee-point eps
+                    eps = utilities.find_dbscan_eps(val_embeddings, min_samples=min_samples)
+                    db = DBSCAN(eps=eps, min_samples=min_samples)
+                    pred_labels = db.fit_predict(val_embeddings)
+                    eps_values = [eps]
 
                     # --- Graph-based Voting with Index Alignment ---
                     # Expand pred_labels to full graph size for voting
@@ -233,7 +235,6 @@ def test():
                         num_vars,
                         num_conss,
                         embeddings=embeddings,
-                        threshold=1.0,
                         var_names=pass_var_names,
                         con_names=pass_con_names
                     )
@@ -270,7 +271,7 @@ def test():
                     output_data = {
                         "instance_name": instance_stem,
                         "clustering_parameters": {
-                            "algorithm": "hierarchical_dbscan",
+                            "algorithm": "simple_dbscan",
                             "min_samples": min_samples,
                             "eps_values_used": [float(e) for e in eps_values] if eps_values else []
                         },

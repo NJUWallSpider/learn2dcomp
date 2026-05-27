@@ -15,7 +15,7 @@ def visualize_embeddings():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Get Test Files
-    test_dir = config.PROCESSED_DATA_DIR / "facilities" / "test"
+    test_dir = config.PROCESSED_DATA_DIR / config.TRAIN_PARAMS['problem'] / "test"
     test_files = sorted(list(test_dir.glob("*.pt")))
 
     if not test_files:

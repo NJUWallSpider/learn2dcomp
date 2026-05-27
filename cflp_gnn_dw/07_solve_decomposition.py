@@ -1,288 +1,230 @@
-import gurobipy as gp
-from gurobipy import GRB
+"""
+Solve GAP using GNN-predicted decomposition as warm-start for DW column generation.
+
+Compares:
+  (A) GNN warm-start → DW CG → final MILP
+  (B) SCIP direct solve of compact formulation
+
+Usage:
+    python 07_solve_decomposition.py --instance data/raw/gap/test/1.txt
+                                     [--warmstart results/decomposition_output/1.json]
+                                     [--output-csv results/dw_results.csv]
+"""
+import sys
+import time
 import json
-import os
 import argparse
 from pathlib import Path
-import networkx as nx
-import time
-import pandas as pd
-import config
-from generic_benders import GenericBenders
+from typing import Optional, Dict
 
-class DecompositionBenders(GenericBenders):
-    def __init__(self, mps_file, json_file):
-        self.mps_file = mps_file
-        self.json_file = json_file
-        self.original_model = None
-        
-        # Pre-process to understand structure
-        self._preprocess()
-        
-        # Initialize GenericBenders
-        # Probabilities = [1.0, 1.0, ...] so that Objective = Master + sum(Sub_i)
-        # We treat each component as an independent subproblem that contributes to the total cost.
-        probs = [1.0] * self.num_components
-        
-        # eta_lb can be 0.0 assuming non-negative costs in subproblems
-        super().__init__(n_scenarios=self.num_components, probabilities=probs, name="DecompBenders", eta_lb=0.0)
+sys.path.insert(0, str(Path(__file__).parent))
 
-    def _preprocess(self):
-        print(f"Loading original model from {self.mps_file}...")
-        self.original_model = gp.read(str(self.mps_file))
-        
-        with open(self.json_file, 'r') as f:
-            decomp_data = json.load(f)
-            
-        pred_master_names = set(decomp_data.get("master_problem", []))
-        all_vars = self.original_model.getVars()
-        self.name_to_var = {v.VarName: v for v in all_vars}
-        
-        # Graph Analysis for Subproblems
-        # Identify variables that are NOT predicted to be in the master
-        sub_candidates = [v for v in all_vars if v.VarName not in pred_master_names]
-        G = nx.Graph()
-        for v in sub_candidates: G.add_node(v.VarName)
-        
-        # Build graph edges based on shared constraints
-        for constr in self.original_model.getConstrs():
-            row = self.original_model.getRow(constr)
-            row_sub_vars = []
-            for i in range(row.size()):
-                v = row.getVar(i)
-                if v.VarName in G:
-                    row_sub_vars.append(v.VarName)
-            
-            # Connect all subproblem variables in the same constraint (clique)
-            if len(row_sub_vars) > 1:
-                base = row_sub_vars[0]
-                for other in row_sub_vars[1:]:
-                    G.add_edge(base, other)
-                    
-        self.components = list(nx.connected_components(G))
-        self.num_components = len(self.components)
-        print(f"Identified {self.num_components} subproblem components.")
-        
-        # Map var -> component index
-        self.var_to_comp = {}
-        for i, comp in enumerate(self.components):
-            for name in comp:
-                self.var_to_comp[name] = i
-                
-        # Identify Real Master Variables (pred_master + orphans)
-        self.master_var_names = []
-        for v in all_vars:
-            if v.VarName not in self.var_to_comp:
-                self.master_var_names.append(v.VarName)
-                
-        # Store constraints data for build steps
-        self.master_constrs_data = [] 
-        self.sub_constrs_data = [[] for _ in range(self.num_components)] 
-        
-        for constr in self.original_model.getConstrs():
-            row = self.original_model.getRow(constr)
-            
-            # Analyze involvement
-            involved_comps = set()
-            master_terms = {} # var_name -> coeff
-            sub_terms = {} # comp_idx -> {var_name -> coeff}
-            
-            for i in range(row.size()):
-                v = row.getVar(i)
-                coeff = row.getCoeff(i)
-                if v.VarName in self.master_var_names:
-                    master_terms[v.VarName] = master_terms.get(v.VarName, 0) + coeff
-                elif v.VarName in self.var_to_comp:
-                    c_idx = self.var_to_comp[v.VarName]
-                    involved_comps.add(c_idx)
-                    if c_idx not in sub_terms: sub_terms[c_idx] = {}
-                    sub_terms[c_idx][v.VarName] = sub_terms[c_idx].get(v.VarName, 0) + coeff
-            
-            data = {
-                'sense': constr.Sense,
-                'rhs': constr.RHS,
-                'name': constr.ConstrName,
-                'master_terms': master_terms,
-                'sub_terms': sub_terms 
-            }
-            
-            if len(involved_comps) == 0:
-                self.master_constrs_data.append(data)
-            elif len(involved_comps) == 1:
-                c_idx = list(involved_comps)[0]
-                self.sub_constrs_data[c_idx].append(data)
-            else:
-                print(f"Warning: Constraint {constr.ConstrName} links multiple subproblems: {involved_comps}. This breaks Benders structure.")
+from gap_model import GAPInstance, build_scip_model
+from gap_cg import GAPColumnGenerator
 
-    def _add_constr(self, model, lhs, sense, rhs, name):
-        """Helper to add constraints compatible with different Gurobi APIs"""
-        if sense == GRB.LESS_EQUAL or sense == '<':
-            return model.addConstr(lhs <= rhs, name=name)
-        elif sense == GRB.GREATER_EQUAL or sense == '>':
-            return model.addConstr(lhs >= rhs, name=name)
-        elif sense == GRB.EQUAL or sense == '=':
-            return model.addConstr(lhs == rhs, name=name)
-        else:
-            return model.addConstr(lhs, sense, rhs, name=name)
 
-    def build_master(self, model):
-        master_vars = {}
-        # Add variables
-        for name in self.master_var_names:
-            orig_v = self.name_to_var[name]
-            v = model.addVar(
-                lb=orig_v.LB, ub=orig_v.UB, obj=0.0, # Obj added in get_master_cost
-                vtype=orig_v.VType, name=name
-            )
-            master_vars[name] = v
-            
-        # Add pure master constraints
-        for data in self.master_constrs_data:
-            lhs = gp.LinExpr()
-            for name, coeff in data['master_terms'].items():
-                lhs.add(master_vars[name], coeff)
-            self._add_constr(model, lhs, data['sense'], data['rhs'], data['name'])
-            
-        return master_vars
+def solve_direct(inst: GAPInstance) -> Dict:
+    """Solve GAP compact formulation directly with SCIP."""
+    t0 = time.time()
+    model, _ = build_scip_model(inst)
+    model.hideOutput()
+    model.optimize()
+    elapsed = time.time() - t0
 
-    def get_master_cost(self, master_vars):
-        cost = gp.LinExpr()
-        for name, var in master_vars.items():
-            orig_obj = self.name_to_var[name].Obj
-            if orig_obj != 0:
-                cost.add(var, orig_obj)
-        return cost
+    status = model.getStatus()
+    return {
+        "direct_status": status,
+        "direct_obj": model.getObjVal() if status == "optimal" else None,
+        "direct_time": elapsed,
+    }
 
-    def build_subproblem(self, model, scenario_id):
-        comp_vars = self.components[scenario_id]
-        local_vars = {}
-        
-        # Add Vars
-        for name in comp_vars:
-            orig_v = self.name_to_var[name]
-            # Force Continuous for Benders subproblems (L-shaped method requires duals)
-            v = model.addVar(
-                lb=orig_v.LB, ub=orig_v.UB, obj=orig_v.Obj, 
-                vtype=GRB.CONTINUOUS, name=name
-            )
-            local_vars[name] = v
-            
-        # Add Constraints
-        model._linking_constrs = [] 
-        
-        for data in self.sub_constrs_data[scenario_id]:
-            lhs = gp.LinExpr()
-            # Add local terms
-            for name, coeff in data['sub_terms'][scenario_id].items():
-                lhs.add(local_vars[name], coeff)
-                
-            constr = self._add_constr(model, lhs, data['sense'], data['rhs'], data['name'])
-            
-            # If it has master terms, it's a linking constraint
-            if data['master_terms']:
-                model._linking_constrs.append({
-                    'constr': constr,
-                    'master_terms': data['master_terms'],
-                    'orig_rhs': data['rhs']
-                })
 
-    def get_linking_map(self, sub_model, scenario_id, master_vars):
-        link_map = {}
-        # If no linking constraints, return empty
-        if not hasattr(sub_model, '_linking_constrs'):
-            return link_map
-            
-        for item in sub_model._linking_constrs:
-            constr = item['constr']
-            orig_rhs = item['orig_rhs']
-            master_terms = item['master_terms']
-            
-            # RHS = Orig_RHS - sum(coeff * master_var)
-            # We construct this expression to pass to GenericBenders
-            rhs_expr = gp.LinExpr(orig_rhs)
-            for name, coeff in master_terms.items():
-                rhs_expr.add(master_vars[name], -coeff)
-                
-            link_map[constr] = rhs_expr
-            
-        return link_map
+def solve_dw(inst: GAPInstance, warmstart_json: Optional[str] = None,
+             max_iter: int = 500, tol: float = 1e-6,
+             milp_time_limit: float = None) -> Dict:
+    """Run DW column generation with optional GNN warm-start."""
+    cg = GAPColumnGenerator(inst)
+    cg.setup_rmp()
+
+    # Warm-start from GNN decomposition
+    warmstart_cols = 0
+    if warmstart_json:
+        with open(warmstart_json, 'r') as f:
+            decomp = json.load(f)
+
+        # Expected format: {"assignment": {job_id: machine_id, ...}}
+        assignment_raw = decomp.get("assignment", {})
+        if assignment_raw:
+            assignment = {int(k): int(v) for k, v in assignment_raw.items()}
+            warmstart_cols = cg.warmstart_from_assignment(assignment)
+
+    # CG phase
+    t0 = time.time()
+    cg_result = cg.run_column_generation(max_iter=max_iter, tol=tol)
+    cg_time = time.time() - t0
+
+    if cg_result is None:
+        return {
+            "cg_status": "rmp_failed",
+            "cg_iterations": 0,
+            "cg_lb": None,
+            "cg_time": cg_time,
+            "milp_status": None,
+            "milp_obj": None,
+            "milp_gap": None,
+            "milp_time": 0.0,
+            "total_columns": sum(len(cols) for cols in cg.columns),
+            "warmstart_columns": warmstart_cols,
+        }
+
+    # Final MILP phase
+    t1 = time.time()
+    milp_result = cg.solve_final_milp(time_limit=milp_time_limit)
+    milp_time = time.time() - t1
+
+    return {
+        "cg_status": cg_result["status"],
+        "cg_iterations": cg_result["iterations"],
+        "cg_lb": cg_result["lb"],
+        "cg_time": cg_time,
+        "milp_status": milp_result["status"],
+        "milp_obj": milp_result["obj_val"],
+        "milp_gap": milp_result["gap"],
+        "milp_time": milp_time,
+        "total_columns": sum(len(cols) for cols in cg.columns),
+        "warmstart_columns": warmstart_cols,
+    }
+
+
+def solve_single_instance(inst_path: str, warmstart_json: Optional[str] = None,
+                          max_iter: int = 500, milp_time_limit: float = None) -> Dict:
+    """Solve one GAP instance: direct SCIP + DW CG."""
+    inst = GAPInstance(inst_path)
+    inst_name = Path(inst_path).stem
+
+    print(f"\n{'='*60}")
+    print(f"Instance: {inst_name} ({inst.n_jobs} jobs x {inst.n_machines} machines)")
+    print(f"{'='*60}")
+
+    # Direct solve
+    print("\n--- SCIP Direct Solve ---")
+    direct = solve_direct(inst)
+    print(f"  Status: {direct['direct_status']}, Obj: {direct['direct_obj']}, "
+          f"Time: {direct['direct_time']:.2f}s")
+
+    # DW solve
+    print("\n--- DW Column Generation ---")
+    dw = solve_dw(inst, warmstart_json=warmstart_json,
+                  max_iter=max_iter, milp_time_limit=milp_time_limit)
+    print(f"  CG: {dw['cg_status']}, {dw['cg_iterations']} iters, "
+          f"LB={dw['cg_lb']}, time={dw['cg_time']:.2f}s")
+    print(f"  MILP: {dw['milp_status']}, obj={dw['milp_obj']}, "
+          f"gap={dw['milp_gap']}, time={dw['milp_time']:.2f}s")
+    print(f"  Columns: {dw['total_columns']} (warmstart: {dw['warmstart_columns']})")
+
+    # Compute optimality gap
+    gap_to_optimal = None
+    if direct["direct_obj"] is not None and dw["milp_obj"] is not None:
+        gap_to_optimal = abs(dw["milp_obj"] - direct["direct_obj"]) / max(1e-6, abs(direct["direct_obj"]))
+
+    return {
+        "instance": inst_name,
+        "n_jobs": inst.n_jobs,
+        "n_machines": inst.n_machines,
+        **direct,
+        **dw,
+        "gap_to_optimal": gap_to_optimal,
+    }
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mps_dir', type=str, default="data/mps/facilities/test")         
-    parser.add_argument('--json_dir', type=str, default="results/decomposition_output")
-    parser.add_argument('--output_csv', type=str, default="results/benders_results.csv")
+    parser = argparse.ArgumentParser(
+        description="GAP DW decomposition solver with GNN warm-start"
+    )
+    parser.add_argument('--instance', type=str, default=None,
+                        help='Path to single .txt instance')
+    parser.add_argument('--instance-dir', type=str, default=None,
+                        help='Path to directory of .txt instances')
+    parser.add_argument('--warmstart-dir', type=str, default=None,
+                        help='Directory of GNN decomposition JSON files')
+    parser.add_argument('--output-csv', type=str, default=None,
+                        help='Path to output results CSV')
+    parser.add_argument('--max-cg-iter', type=int, default=500)
+    parser.add_argument('--milp-time-limit', type=float, default=None)
+    parser.add_argument('--no-csv', action='store_true',
+                        help='Print results but do not save to CSV')
     args = parser.parse_args()
 
-    # Defaults
-    mps_dir = Path(args.mps_dir) if args.mps_dir else config.MPS_DATA_DIR / "facilities" / "test"
-    json_dir = Path(args.json_dir) if args.json_dir else config.RESULTS_DIR / "decomposition_output"
-    
-    if not mps_dir.exists():
-        print(f"Error: MPS directory not found: {mps_dir}")
-        return
-        
-    results = []
-    mps_files = sorted(list(mps_dir.glob("*.mps")))
-    
-    if not mps_files:
-        print(f"Warning: No .mps files found in {mps_dir}")
+    if args.instance:
+        instances = [args.instance]
+    elif args.instance_dir:
+        instances = sorted([str(p) for p in Path(args.instance_dir).glob("*.txt")])
+    else:
+        # Default: test set
+        test_dir = Path(__file__).parent / "data" / "raw" / "gap" / "test"
+        instances = sorted([str(p) for p in test_dir.glob("*.txt")])
 
-    for mps_file in mps_files:
-        instance = mps_file.stem
-        json_file = json_dir / f"{instance}_decomposition.json"
-        
-        if not json_file.exists():
-            print(f"Warning: Decomposition file not found for {instance}, skipping.")
-            continue
-            
-        print(f"Solving {instance}...")
-        
+    if not instances:
+        print("No instances found.")
+        return
+
+    warmstart_dir = None
+    if args.warmstart_dir:
+        warmstart_dir = Path(args.warmstart_dir)
+
+    results = []
+    for inst_path in instances:
+        inst_name = Path(inst_path).stem
+
+        ws_json = None
+        if warmstart_dir:
+            json_path = warmstart_dir / f"{inst_name}_decomposition.json"
+            if json_path.exists():
+                ws_json = str(json_path)
+            else:
+                print(f"  Warning: warmstart JSON not found for {inst_name}")
+
         try:
-            pre_solve_start = time.time()
-            solver = DecompositionBenders(mps_file, json_file)
-            pre_solve_end = time.time()
-            
-            solve_start = time.time()
-            solver.solve()
-            solve_end = time.time()
-            
-            pre_solve_time = pre_solve_end - pre_solve_start
-            solve_time = solve_end - solve_start
-            
-            res = {
-                "Instance": instance,
-                "Status": solver.master.Status,
-                "ObjVal": solver.master.ObjVal if solver.master.Status == GRB.OPTIMAL else None,
-                "PreSolveTime": pre_solve_time,
-                "SolveTime": solve_time,
-                "NumSubproblems": solver.num_components
-            }
-            print(f"  Result: {res}")
-            results.append(res)
-            
+            result = solve_single_instance(
+                inst_path,
+                warmstart_json=ws_json,
+                max_iter=args.max_cg_iter,
+                milp_time_limit=args.milp_time_limit
+            )
+            results.append(result)
         except Exception as e:
-            print(f"Error: Failed to solve {instance}: {e}")
+            print(f"Error solving {inst_name}: {e}")
             import traceback
             traceback.print_exc()
-        
-        
+
+    # Summary
     if results:
-        # Ensure directory exists
-        Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
-        df = pd.DataFrame(results)
-        df.to_csv(args.output_csv, index=False)
-        print(f"Results saved to {args.output_csv}")
-        
-        print("\n--- Timing Statistics ---")
-        if len(df) > 1:
-            print(f"Pre-solve Time: Mean = {df['PreSolveTime'].mean():.4f} s, Std = {df['PreSolveTime'].std():.4f} s")
-            print(f"Solve Time:     Mean = {df['SolveTime'].mean():.4f} s, Std = {df['SolveTime'].std():.4f} s")
-        else:
-            print(f"Pre-solve Time: Mean = {df['PreSolveTime'].mean():.4f} s")
-            print(f"Solve Time:     Mean = {df['SolveTime'].mean():.4f} s")
-    else:
-        print("No results to save.")
+        print(f"\n{'='*60}")
+        print(f"Summary ({len(results)} instances)")
+        print(f"{'='*60}")
+
+        cg_iters = [r["cg_iterations"] for r in results if r["cg_status"] == "converged"]
+        dw_feasible = [r for r in results if r["milp_status"] == "optimal"]
+
+        if cg_iters:
+            print(f"  Avg CG iterations: {sum(cg_iters) / len(cg_iters):.1f}")
+        if dw_feasible:
+            avg_gap = sum(r.get("gap_to_optimal", 0) or 0 for r in dw_feasible) / len(dw_feasible)
+            print(f"  DW MILP solved: {len(dw_feasible)}/{len(results)}")
+            print(f"  Avg optimality gap: {avg_gap:.6f}")
+
+        # Save CSV
+        if args.output_csv and not args.no_csv:
+            import csv
+            output_path = Path(args.output_csv)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if results:
+                with open(output_path, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=results[0].keys())
+                    writer.writeheader()
+                    writer.writerows(results)
+            print(f"\nResults saved to {output_path}")
+
 
 if __name__ == "__main__":
     main()

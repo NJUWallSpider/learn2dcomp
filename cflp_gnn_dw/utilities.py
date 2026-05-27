@@ -2,12 +2,9 @@
 import datetime
 import numpy as np
 import scipy.sparse as sp
-import pyscipopt as scip
 import argparse
 from sklearn.neighbors import NearestNeighbors
 from sklearn.cluster import DBSCAN
-import gurobipy as gp
-from gurobipy import GRB
 
 
 def valid_seed(seed):

@@ -1,6 +1,7 @@
 import torch
 from torch_geometric.loader import DataLoader
 import numpy as np
+from sklearn.cluster import DBSCAN
 import config
 from data_process import MILPDataset, add_laplacian_pe
 from gnn_model import GraphTransformer
@@ -11,6 +12,63 @@ from pathlib import Path
 import collections
 import os
 import argparse
+
+
+def derive_assignment_from_clusters(final_labels, valid_var_names, embeddings):
+    """
+    Derive job->machine assignment from GNN variable clustering.
+
+    Parses variable names like 'x_0_1' (job_0, machine_1) and maps each
+    cluster to the dominant machine, then produces a concrete assignment.
+
+    Returns dict: {job_id: machine_id, ...}
+    """
+    # Parse variable names
+    var_info = []  # [(job_idx, machine_idx), ...]
+    for name in valid_var_names:
+        parts = name.split('_')
+        if len(parts) >= 3 and parts[0] == 'x':
+            var_info.append((int(parts[1]), int(parts[2])))
+        else:
+            var_info.append(None)
+
+    # Map cluster -> dominant machine
+    cluster_machine_votes = collections.defaultdict(lambda: collections.Counter())
+    for idx, label in enumerate(final_labels):
+        if label >= 0 and var_info[idx] is not None:
+            _i, j = var_info[idx]
+            cluster_machine_votes[label][j] += 1
+
+    cluster_to_machine = {}
+    for cluster_id, votes in cluster_machine_votes.items():
+        if votes:
+            cluster_to_machine[cluster_id] = votes.most_common(1)[0][0]
+
+    # Determine n_jobs and n_machines from variable names
+    valid_infos = [vi for vi in var_info if vi is not None]
+    if not valid_infos:
+        return {}
+    n_jobs = max(vi[0] for vi in valid_infos) + 1
+
+    # For each job, find consistent machine assignment
+    assignment = {}
+    for i in range(n_jobs):
+        candidates = {}  # machine -> score (negated distance to cluster center)
+        for idx, label in enumerate(final_labels):
+            if label >= 0 and var_info[idx] is not None:
+                vi, j = var_info[idx]
+                if vi == i and label in cluster_to_machine:
+                    if cluster_to_machine[label] == j:
+                        # Variable is consistent: its cluster maps to its machine
+                        dist = np.linalg.norm(embeddings[idx] - np.mean(
+                            embeddings[final_labels == label], axis=0))
+                        candidates[j] = -dist  # closer = higher score
+
+        if candidates:
+            assignment[i] = max(candidates, key=candidates.get)
+
+    return assignment
+
 
 def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
     # 1. Configuration & Setup
@@ -44,8 +102,6 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
 
     # Determine input files
     if input_dir is None:
-        # Default to test folder defined in config
-        # Taking the first folder from TEST_FOLDERS as default source
         folder_name = config.TEST_FOLDERS[0]
         input_dir = config.PROCESSED_DATA_DIR / config.TRAIN_PARAMS['problem'] / folder_name
     else:
@@ -58,8 +114,7 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
     # Collect .pt files
     if input_dir.is_file() and input_dir.suffix == '.pt':
         files = [str(input_dir)]
-        # Parent of file is the input dir context
-        input_dir = input_dir.parent 
+        input_dir = input_dir.parent
     else:
         files = sorted([str(f) for f in input_dir.glob("*.pt")])
 
@@ -72,15 +127,15 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
         output_dir = config.RESULTS_DIR / "decomposition_output"
     else:
         output_dir = Path(output_dir)
-    
+
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
     # Dataset & Loader
     dataset = MILPDataset(files, transform=add_laplacian_pe)
     loader = DataLoader(
-        dataset, 
-        batch_size=1, 
+        dataset,
+        batch_size=1,
         shuffle=False,
         num_workers=config.TRAIN_PARAMS['num_workers']
     )
@@ -95,8 +150,8 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
                 var_names = data.var_names
                 if isinstance(var_names, list) and len(var_names) > 0 and isinstance(var_names[0], list):
                     var_names = [item for sublist in var_names for item in sublist]
-            
-            # Retrieve constraint names (needed for voting logic inside utilities if enabled, but here mostly for completeness)
+
+            # Retrieve constraint names
             con_names = []
             if hasattr(data, 'con_names'):
                 con_names = data.con_names
@@ -105,7 +160,7 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
 
             pt_path = Path(dataset.sample_files[i])
             instance_name = pt_path.stem
-            
+
             data = data.to(device)
 
             # Model Inference
@@ -116,50 +171,30 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
                 continue
 
             embeddings = var_emb.cpu().numpy()
-            labels = data['variable'].y.cpu().numpy() # We use this mask to identify valid variables vs padding/dummies
+            labels = data['variable'].y.cpu().numpy()
 
-            # Mask for valid variables (usually labels >= 0 or similar logic if labels exist)
-            # If labels are all -1 (inference mode without ground truth), we might need another way.
-            # Assuming labels are present as -1 for noise or valid class integers.
-            # If this is pure inference without ground truth labels in .pt, we assume all nodes are valid or use a mask if provided.
-            # Based on 04_test.py, it uses `mask = labels >= 0`. 
-            # If the dataset is for evaluation and has no ground truth, this might be risky if `y` is not set or -1.
-            # However, typically MILPDataset ensures `y` exists.
-            
-            # Let's assume we want to cluster ALL variables that are part of the problem.
-            # In 04_test, `mask = labels >= 0` implies we ignore variables labeled -1 (maybe auxiliary/dummy?).
-            # For decomposition, we likely want to decompose the original problem variables.
-            # Let's stick to the 04_test logic for consistency, assuming -1 labels in input are 'ignore'.
-            
             mask = labels >= 0
             if mask.sum() == 0:
-                # If no labels >= 0, maybe it's an unlabeled instance?
-                # In that case, use all variables.
                 mask = np.ones(len(labels), dtype=bool)
 
             val_embeddings = embeddings[mask]
-            
+
             # Handle Variable Names
             valid_var_names = []
             if var_names:
                 if len(var_names) == len(labels):
-                     valid_var_names = np.array(var_names)[mask].tolist()
+                    valid_var_names = np.array(var_names)[mask].tolist()
                 else:
-                     # Fallback if length mismatch
-                     valid_var_names = [f"var_{idx}" for idx in np.where(mask)[0]]
+                    valid_var_names = [f"var_{idx}" for idx in np.where(mask)[0]]
             else:
                 valid_var_names = [f"var_{idx}" for idx in np.where(mask)[0]]
 
-            # 1. Hierarchical DBSCAN
+            # 1. Simple DBSCAN with knee-point eps
             min_samples = config.EVAL_PARAMS.get('dbscan_min_samples', 2)
-            pred_labels, _ = utilities.hierarchical_dbscan(val_embeddings, min_samples=min_samples)
+            eps = utilities.find_dbscan_eps(val_embeddings, min_samples=min_samples)
+            db = DBSCAN(eps=eps, min_samples=min_samples)
+            pred_labels = db.fit_predict(val_embeddings)
 
-            # Determine Master Label Logic (Mirroring utilities.py)
-            # utilities.graph_voting_reassignment uses: master_label = np.max(valid_labels) + 1
-            # We need to know what this value is BEFORE voting modifies it, or infer it after.
-            # Actually, `utilities.graph_voting_reassignment` calculates it internally.
-            # We can calculate it here to identify which ID becomes the master.
-            
             current_valid_labels = pred_labels[pred_labels >= 0]
             if len(current_valid_labels) > 0:
                 master_label_id = int(np.max(current_valid_labels) + 1)
@@ -167,50 +202,48 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
                 master_label_id = 0
 
             # 2. Graph Voting Reassignment
-            # We need full graph labels for voting
             num_vars = data['variable'].num_nodes
             full_pred_labels = np.full(num_vars, -1, dtype=int)
             full_pred_labels[mask] = pred_labels
-            
+
             edge_index = data['variable', 'connected_to', 'constraint'].edge_index
             num_conss = data['constraint'].num_nodes
 
             full_pred_labels = utilities.graph_voting_reassignment(
-                full_pred_labels, 
-                edge_index, 
-                num_vars, 
-                num_conss, 
+                full_pred_labels,
+                edge_index,
+                num_vars,
+                num_conss,
                 embeddings=embeddings
             )
-            
+
             final_labels = full_pred_labels[mask]
 
-            # 3. Organize Output
-            # Master Problem: Variables with label == master_label_id
-            # Subproblems: Variables with other non-negative labels
-            # Noise (if any remains): Could be treated as Master or separate. Usually Voting handles this.
-            
+            # 3. Organize decomposition output
             subproblems = collections.defaultdict(list)
             master_problem = []
-            
+
             for idx, label in enumerate(final_labels):
                 v_name = valid_var_names[idx]
                 if label == master_label_id:
                     master_problem.append(v_name)
                 elif label == -1:
-                    # Treat remaining noise as Master (conservative approach) or keep separate?
-                    # "Unassigned" usually go to Master in decomposition.
                     master_problem.append(v_name)
                 else:
                     subproblems[int(label)].append(v_name)
 
-            # Re-key subproblems to be 1, 2, 3... sequentially for clean output
+            # Re-key subproblems sequentially
             sorted_sub_keys = sorted(subproblems.keys())
             ordered_subproblems = {}
             for new_id, old_id in enumerate(sorted_sub_keys, start=1):
                 ordered_subproblems[str(new_id)] = sorted(subproblems[old_id])
 
-            # Constraint classification predictions (for DW decomposition)
+            # 4. Derive job->machine assignment from clustering
+            assignment = derive_assignment_from_clusters(
+                final_labels, valid_var_names, val_embeddings
+            )
+
+            # 5. Constraint classification predictions
             con_pred = {}
             if con_linking_logits is not None:
                 linking_pred = (torch.sigmoid(con_linking_logits).cpu().numpy() > 0.5).flatten()
@@ -228,13 +261,15 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
 
             output_data = {
                 "instance_name": instance_name,
+                "assignment": {str(k): v for k, v in assignment.items()},
                 "master_problem": sorted(master_problem),
                 "subproblems": ordered_subproblems,
                 "constraint_decomposition": con_pred,
                 "stats": {
                     "num_subproblems": len(ordered_subproblems),
                     "num_master_vars": len(master_problem),
-                    "total_vars": len(final_labels)
+                    "total_vars": len(final_labels),
+                    "num_assigned_jobs": len(assignment),
                 }
             }
 
@@ -245,12 +280,13 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
 
     print(f"Decomposition results saved to {output_dir}")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate instances and generate decomposition clusters.")
     parser.add_argument('--input', type=str, help="Path to input .pt file or directory.")
     parser.add_argument('--output', type=str, help="Directory to save output JSON files.")
     parser.add_argument('--model', type=str, help="Path to trained model .pth file.")
-    
+
     args = parser.parse_args()
-    
+
     evaluate_instances(args.input, args.output, args.model)

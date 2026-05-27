@@ -81,11 +81,11 @@ class GraphTransformer(nn.Module):
             conv = HeteroConv({
                 ('variable', 'connected_to', 'constraint'): TransformerConv(
                     hidden_dim, hidden_dim // num_heads, heads=num_heads,
-                    edge_dim=3, dropout=0.1
+                    edge_dim=2, dropout=0.1
                 ),
                 ('constraint', 'rev_connected_to', 'variable'): TransformerConv(
                     hidden_dim, hidden_dim // num_heads, heads=num_heads,
-                    edge_dim=3, dropout=0.1
+                    edge_dim=2, dropout=0.1
                 )
             }, aggr='sum')
             self.layers.append(conv)
