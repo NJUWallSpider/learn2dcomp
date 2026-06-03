@@ -1,0 +1,19 @@
+sync:
+  code-sync:
+    alpha: ./          # 本地项目路径（当前目录）
+    beta: V100:/home/ycliu/projects/learn2dcomp  # 服务器路径
+
+    # mode: one-way-safe   # ⭐ 推荐，避免误删服务器文件
+    mode: one-way-safe
+
+    ignore:
+      vcs: true
+      paths:
+        - __pycache__
+        - .venv
+        - data
+        - models
+        - "*.pt"
+        - "*.ckpt"
+        - "*.npy"
+        - .vscode

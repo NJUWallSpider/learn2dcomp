@@ -1,0 +1,1 @@
+- [Project Architecture](project_architecture.md) — Complete codebase map: 7-step data flow, key files, known bugs, dispatch system
