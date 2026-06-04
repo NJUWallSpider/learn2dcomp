@@ -1,10 +1,10 @@
-# 在多个文件中调用的函数
 import datetime
 import numpy as np
 import scipy.sparse as sp
 import argparse
 from sklearn.neighbors import NearestNeighbors
 from sklearn.cluster import DBSCAN
+import hdbscan
 
 
 def valid_seed(seed):
@@ -30,6 +30,32 @@ def cluster_with_dbscan(embeddings, eps, min_samples=2):
     """
     dbscan = DBSCAN(eps=eps, min_samples=min_samples)
     return dbscan.fit_predict(embeddings)
+
+
+def cluster_with_hdbscan(embeddings, min_cluster_size=5, min_samples=None,
+                         cluster_selection_epsilon=0.0):
+    """
+    HDBSCAN clustering — automatically finds clusters of varying density.
+
+    Returns label array (same length as embeddings), -1 = noise.
+
+    Args:
+        embeddings: (n_points, n_dims) numpy array
+        min_cluster_size: smallest grouping to consider a cluster
+        min_samples: how conservative the clustering is (higher = more noise).
+                     Defaults to min_cluster_size if not set.
+        cluster_selection_epsilon: merge clusters within this distance
+    """
+    if min_samples is None:
+        min_samples = min_cluster_size
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        metric='euclidean',
+        core_dist_n_jobs=-1,
+    )
+    return clusterer.fit_predict(embeddings)
 
 
 def hierarchical_dbscan(embeddings, min_samples, start_scale=0.2, step_scale=0.2, max_scale=4.0):

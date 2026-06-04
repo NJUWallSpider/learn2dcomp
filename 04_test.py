@@ -71,8 +71,31 @@ def test(problem=None):
 
     print(f"Loading model from {model_path}...")
     try:
-        model = GraphTransformer(hidden_dim=config.MODEL_PARAMS['emb_size']).to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict) and 'arch' in checkpoint:
+            arch = checkpoint['arch']
+            model = GraphTransformer(
+                hidden_dim=arch['emb_size'],
+                pe_dim=arch.get('pe_dim', 8),
+                block_pe_dim=arch.get('block_pe_dim', 8),
+                homophilic_conv_layers=arch.get('homophilic_conv_layers', 0),
+                homophilic_conv_heads=arch.get('homophilic_conv_heads', 4),
+            ).to(device)
+            state_dict = {
+                k: v for k, v in checkpoint['model_state_dict'].items()
+                if not k.startswith('cg_predictor')
+            }
+            model.load_state_dict(state_dict, strict=False)
+        else:
+            p0 = config.P0_HOMOPHILIC_PARAMS
+            model = GraphTransformer(
+                hidden_dim=config.MODEL_PARAMS['emb_size'],
+                pe_dim=config.MODEL_PARAMS.get('pe_dim', 8),
+                block_pe_dim=config.MODEL_PARAMS.get('block_pe_dim', 8),
+                homophilic_conv_layers=p0.get('homophilic_conv_layers', 0),
+                homophilic_conv_heads=p0.get('homophilic_conv_heads', 4),
+            ).to(device)
+            model.load_state_dict(checkpoint)
         model.eval()
     except Exception as e:
         print(f"Failed to load model: {e}")
@@ -172,22 +195,24 @@ def test(problem=None):
                 # Record True Clusters Count
                 metrics['per_instance_true_n_clusters'].append(len(np.unique(val_labels)))
                 
-                # Clustering — adaptive min_samples
-                min_samples = max(2, int(
-                    config.EVAL_PARAMS.get('dbscan_min_samples_frac', 0.05)
-                    * val_embeddings.shape[0]
+                # Clustering — adaptive min_cluster_size
+                n_vars = val_embeddings.shape[0]
+                min_cluster_size = max(2, int(
+                    config.EVAL_PARAMS.get('hdbscan_min_cluster_size_frac', 0.05)
+                    * n_vars
                 ))
-                eps_scale = config.EVAL_PARAMS.get('dbscan_eps_scale', 1.0)
+                min_samples = max(1, int(
+                    config.EVAL_PARAMS.get('hdbscan_min_samples_frac', 0.02)
+                    * n_vars
+                ))
 
                 try:
-                    # Use standard DBSCAN with auto eps (elbow method + configurable scale)
-                    eps = utilities.find_dbscan_eps(
-                        val_embeddings, min_samples, scaling_factor=eps_scale
+                    # HDBSCAN — automatically finds clusters of varying density
+                    pred_labels = utilities.cluster_with_hdbscan(
+                        val_embeddings,
+                        min_cluster_size=min_cluster_size,
+                        min_samples=min_samples,
                     )
-                    pred_labels = utilities.cluster_with_dbscan(
-                        val_embeddings, eps=eps, min_samples=min_samples
-                    )
-                    eps_values = [eps]
                     
                     # --- Graph-based Voting with Index Alignment ---
                     # Expand pred_labels to full graph size for voting
@@ -250,9 +275,9 @@ def test(problem=None):
                     output_data = {
                         "instance_name": instance_stem,
                         "clustering_parameters": {
-                            "algorithm": "hierarchical_dbscan",
+                            "algorithm": "hdbscan",
+                            "min_cluster_size": min_cluster_size,
                             "min_samples": min_samples,
-                            "eps_values_used": [float(e) for e in eps_values] if eps_values else []
                         },
                         "summary": {
                             "num_clusters": len(clusters),

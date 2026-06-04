@@ -104,8 +104,8 @@ EVAL_FOLDERS = ["test"]
 
 EVAL_PARAMS = {
     'test_batch_size': 1,
-    'dbscan_min_samples_frac': 0.05,  # min_samples = frac * n_vars (adaptive)
-    'dbscan_eps_scale': 2.0,         # multiplier for auto-estimated eps
+    'hdbscan_min_cluster_size_frac': 0.05,  # min_cluster_size = frac * n_vars (adaptive)
+    'hdbscan_min_samples_frac': 0.02,       # min_samples = frac * n_vars (conservative)
 }
 
 # --- DW Solver Parameters ---

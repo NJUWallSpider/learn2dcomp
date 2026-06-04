@@ -37,13 +37,28 @@ def visualize_embeddings(problem=None):
 
     # Initialize Model (Same params as training)
     sample_data = dataset[0]
-    model = GraphTransformer(
-        hidden_dim=config.MODEL_PARAMS['emb_size'],
-        pe_dim=config.MODEL_PARAMS.get('pe_dim', 8),
-        block_pe_dim=config.MODEL_PARAMS.get('block_pe_dim', 8),
-    ).to(device)
-    
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict) and 'arch' in checkpoint:
+        arch = checkpoint['arch']
+        model = GraphTransformer(
+            hidden_dim=arch['emb_size'],
+            pe_dim=arch.get('pe_dim', 8),
+            block_pe_dim=arch.get('block_pe_dim', 8),
+            homophilic_conv_layers=arch.get('homophilic_conv_layers', 0),
+            homophilic_conv_heads=arch.get('homophilic_conv_heads', 4),
+        ).to(device)
+        state_dict = {
+            k: v for k, v in checkpoint['model_state_dict'].items()
+            if not k.startswith('cg_predictor')
+        }
+        model.load_state_dict(state_dict, strict=False)
+    else:
+        model = GraphTransformer(
+            hidden_dim=config.MODEL_PARAMS['emb_size'],
+            pe_dim=config.MODEL_PARAMS.get('pe_dim', 8),
+            block_pe_dim=config.MODEL_PARAMS.get('block_pe_dim', 8),
+        ).to(device)
+        model.load_state_dict(checkpoint)
     model.eval()
     
     # Get Data

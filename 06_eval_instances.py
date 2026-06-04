@@ -41,7 +41,11 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None, problem
                 homophilic_conv_layers=arch.get('homophilic_conv_layers', 0),
                 homophilic_conv_heads=arch.get('homophilic_conv_heads', 4),
             ).to(device)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = {
+                k: v for k, v in checkpoint['model_state_dict'].items()
+                if not k.startswith('cg_predictor')
+            }
+            model.load_state_dict(state_dict, strict=False)
         else:
             # Old format: raw state_dict
             p0 = config.P0_HOMOPHILIC_PARAMS
@@ -166,14 +170,21 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None, problem
             else:
                 valid_var_names = [f"var_{idx}" for idx in np.where(mask)[0]]
 
-            # 1. Standard DBSCAN with auto eps — adaptive min_samples
-            min_samples = max(2, int(
-                config.EVAL_PARAMS.get('dbscan_min_samples_frac', 0.05)
-                * val_embeddings.shape[0]
+            # 1. HDBSCAN — adaptive min_cluster_size and min_samples
+            n_vars = val_embeddings.shape[0]
+            min_cluster_size = max(2, int(
+                config.EVAL_PARAMS.get('hdbscan_min_cluster_size_frac', 0.05)
+                * n_vars
             ))
-            eps_scale = config.EVAL_PARAMS.get('dbscan_eps_scale', 1.0)
-            eps = utilities.find_dbscan_eps(val_embeddings, min_samples, scaling_factor=eps_scale)
-            pred_labels = utilities.cluster_with_dbscan(val_embeddings, eps=eps, min_samples=min_samples)
+            min_samples = max(1, int(
+                config.EVAL_PARAMS.get('hdbscan_min_samples_frac', 0.02)
+                * n_vars
+            ))
+            pred_labels = utilities.cluster_with_hdbscan(
+                val_embeddings,
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+            )
 
             # 1b. Determine Master Label Logic
             # NOTE: reassign_noise_points deliberately skipped here.
