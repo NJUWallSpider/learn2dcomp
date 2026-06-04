@@ -10,3 +10,8 @@ __pycache__/
 *.txt
 mutagen.yml.lock
 .env
+.claude/
+logs/
+results.parquet
+grid/
+CLAUDE.md
