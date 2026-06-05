@@ -10,3 +10,11 @@ Desktop.ini
 .DS_Store
 venv/
 *.pdf
+*.aux
+*.out
+*.tex
+*.toc
+gurobi.lic*
+verify_solve.py
+project_progress.*
+~?.bashrc

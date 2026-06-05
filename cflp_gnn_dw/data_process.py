@@ -85,7 +85,7 @@ def add_laplacian_pe(data, k=8):
         eig_vals, eig_vecs = spla.eigsh(L, k=k+1, which='SM')
     except Exception as e:
         # Fallback for small graphs or convergence issues
-        # Pad with zeros if failed
+        eig_vals = np.zeros(k + 1)
         eig_vecs = np.zeros((num_nodes, k+1))
         
     # Sort just in case (eigsh usually sorts, but 'SM' magnitude...)
@@ -105,7 +105,64 @@ def add_laplacian_pe(data, k=8):
     # Assign back
     data['variable'].pe = pe[:num_vars]
     data['constraint'].pe = pe[num_vars:]
-    
+
+    return data
+
+
+def add_block_pe(data, k=8):
+    """Block-structure PE via Louvain community detection on bipartite graph."""
+    import numpy as np
+    import networkx as nx
+    from networkx.algorithms.community import louvain_communities
+
+    num_vars = data['variable'].num_nodes
+    num_cons = data['constraint'].num_nodes
+    num_nodes = num_vars + num_cons
+    edge_index = data['variable', 'connected_to', 'constraint'].edge_index
+
+    G = nx.Graph()
+    G.add_nodes_from(range(num_vars), bipartite=0)
+    G.add_nodes_from(range(num_vars, num_nodes), bipartite=1)
+    edges = [(int(edge_index[0, i]), int(edge_index[1, i] + num_vars))
+             for i in range(edge_index.shape[1])]
+    G.add_edges_from(edges)
+
+    try:
+        communities = louvain_communities(G, seed=42)
+    except Exception:
+        communities = [{i} for i in range(num_nodes)]
+
+    comm_id = np.zeros(num_nodes, dtype=np.int64)
+    for cid, comm in enumerate(communities):
+        for node in comm:
+            comm_id[node] = cid
+
+    comm_sizes = np.array([len(c) for c in communities])
+    comm_size_ratio = comm_sizes / num_nodes
+
+    is_boundary = np.zeros(num_nodes, dtype=np.float32)
+    for i in range(edge_index.shape[1]):
+        v = int(edge_index[0, i])
+        c = int(edge_index[1, i]) + num_vars
+        if comm_id[v] != comm_id[c]:
+            is_boundary[v] = 1.0
+            is_boundary[c] = 1.0
+
+    pe = np.zeros((num_nodes, k), dtype=np.float32)
+    for node in range(num_nodes):
+        cid = comm_id[node]
+        pe[node, 0] = comm_size_ratio[cid]
+        pe[node, 1] = is_boundary[node]
+        if k > 2:
+            for d in range(2, k):
+                if d % 2 == 0:
+                    pe[node, d] = np.sin(cid / (10000 ** ((d - 2) / max(k - 2, 1))))
+                else:
+                    pe[node, d] = np.cos(cid / (10000 ** ((d - 3) / max(k - 2, 1))))
+
+    pe = torch.tensor(pe, dtype=torch.float)
+    data['variable'].block_pe = pe[:num_vars]
+    data['constraint'].block_pe = pe[num_vars:]
     return data
 
 class MILPDataset(torch.utils.data.Dataset):

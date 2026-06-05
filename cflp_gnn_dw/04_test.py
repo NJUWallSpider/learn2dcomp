@@ -74,6 +74,7 @@ def test():
             num_layers=mp.get('num_layers', 2),
             num_heads=mp.get('num_heads', 4),
             pe_dim=mp.get('pe_dim', 8),
+            block_pe_dim=mp.get('block_pe_dim', 8),
             max_con_blocks=mp.get('max_con_blocks', 128),
         ).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -98,7 +99,7 @@ def test():
             print(f"No .pt files found in {test_dir}")
             continue
 
-        test_dataset = MILPDataset(test_files, transform=add_laplacian_pe)
+        test_dataset = MILPDataset(test_files)  # PE already in .pt
 
         test_loader = DataLoader(
             test_dataset,
@@ -150,7 +151,7 @@ def test():
 
                 # Forward pass
                 try:
-                    var_emb, con_block_logits, con_linking_logits = model(data)
+                    var_emb, con_emb, con_block_logits, con_linking_logits = model(data)
                 except Exception as e:
                     print(f"Error during forward pass on instance {i}: {e}")
                     continue
@@ -202,14 +203,21 @@ def test():
                 metrics['per_instance_true_n_clusters'].append(len(np.unique(val_labels)))
 
                 # Clustering
-                min_samples = config.EVAL_PARAMS.get('dbscan_min_samples', 2)
+                frac = config.EVAL_PARAMS.get('dbscan_min_samples_frac', 0.05)
+                min_samples = max(2, int(len(val_embeddings) * frac))
 
                 try:
-                    # Simple DBSCAN with knee-point eps
-                    eps = utilities.find_dbscan_eps(val_embeddings, min_samples=min_samples)
-                    db = DBSCAN(eps=eps, min_samples=min_samples)
-                    pred_labels = db.fit_predict(val_embeddings)
-                    eps_values = [eps]
+                    # 1. Hierarchical DBSCAN: multi-scale eps
+                    pred_labels, eps_values = utilities.hierarchical_dbscan(
+                        val_embeddings,
+                        min_samples=min_samples,
+                        start_scale=0.2,
+                        step_scale=0.2,
+                        max_scale=4.0,
+                    )
+
+                    # 2. Reassign remaining noise to nearest centroid
+                    pred_labels = utilities.reassign_noise_points(val_embeddings, pred_labels)
 
                     # --- Graph-based Voting with Index Alignment ---
                     # Expand pred_labels to full graph size for voting

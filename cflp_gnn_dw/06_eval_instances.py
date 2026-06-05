@@ -92,6 +92,7 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
             num_layers=mp.get('num_layers', 2),
             num_heads=mp.get('num_heads', 4),
             pe_dim=mp.get('pe_dim', 8),
+            block_pe_dim=mp.get('block_pe_dim', 8),
             max_con_blocks=mp.get('max_con_blocks', 128),
         ).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -132,7 +133,7 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
     print(f"Output directory: {output_dir}")
 
     # Dataset & Loader
-    dataset = MILPDataset(files, transform=add_laplacian_pe)
+    dataset = MILPDataset(files)  # PE already in .pt
     loader = DataLoader(
         dataset,
         batch_size=1,
@@ -165,7 +166,7 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
 
             # Model Inference
             try:
-                var_emb, con_block_logits, con_linking_logits = model(data)
+                var_emb, con_emb, con_block_logits, con_linking_logits = model(data)
             except Exception as e:
                 print(f"Error processing {instance_name}: {e}")
                 continue
@@ -189,11 +190,45 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
             else:
                 valid_var_names = [f"var_{idx}" for idx in np.where(mask)[0]]
 
-            # 1. Simple DBSCAN with knee-point eps
-            min_samples = config.EVAL_PARAMS.get('dbscan_min_samples', 2)
-            eps = utilities.find_dbscan_eps(val_embeddings, min_samples=min_samples)
-            db = DBSCAN(eps=eps, min_samples=min_samples)
-            pred_labels = db.fit_predict(val_embeddings)
+            # ================================================================
+            # A. Constraint DBSCAN → primary decomposition (220 constraints vs 4000 vars)
+            # ================================================================
+            con_emb_np = con_emb.cpu().numpy()
+            con_min_samples = max(2, data['constraint'].num_nodes // 20)
+            con_pred_labels, con_eps = utilities.hierarchical_dbscan(
+                con_emb_np,
+                min_samples=con_min_samples,
+                start_scale=0.1,
+                step_scale=0.15,
+                max_scale=3.0,
+            )
+            con_pred_labels = utilities.reassign_noise_points(con_emb_np, con_pred_labels)
+
+            # Build constraint decomposition from DBSCAN clusters
+            con_linking_pred = []
+            con_block_pred = {}
+            for idx, label in enumerate(con_pred_labels):
+                name = con_names[idx] if con_names and idx < len(con_names) else str(idx)
+                if label == -1:
+                    con_linking_pred.append(name)
+                else:
+                    con_block_pred[name] = int(label)
+
+            # ================================================================
+            # B. Variable DBSCAN → auxiliary (for assignment derivation)
+            # ================================================================
+            frac = config.EVAL_PARAMS.get('dbscan_min_samples_frac', 0.05)
+            min_samples = max(2, int(len(val_embeddings) * frac))
+            pred_labels, eps_values = utilities.hierarchical_dbscan(
+                val_embeddings,
+                min_samples=min_samples,
+                start_scale=0.2,
+                step_scale=0.2,
+                max_scale=4.0,
+            )
+
+            # Reassign remaining noise to nearest cluster centroid
+            pred_labels = utilities.reassign_noise_points(val_embeddings, pred_labels)
 
             current_valid_labels = pred_labels[pred_labels >= 0]
             if len(current_valid_labels) > 0:
@@ -201,7 +236,7 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
             else:
                 master_label_id = 0
 
-            # 2. Graph Voting Reassignment
+            # 3. Graph Voting Reassignment: use bipartite graph topology
             num_vars = data['variable'].num_nodes
             full_pred_labels = np.full(num_vars, -1, dtype=int)
             full_pred_labels[mask] = pred_labels
@@ -262,11 +297,21 @@ def evaluate_instances(input_dir=None, output_dir=None, model_path=None):
             output_data = {
                 "instance_name": instance_name,
                 "assignment": {str(k): v for k, v in assignment.items()},
-                "master_problem": sorted(master_problem),
-                "subproblems": ordered_subproblems,
-                "constraint_decomposition": con_pred,
+                # Primary: constraint DBSCAN decomposition
+                "constraint_decomposition": {
+                    "linking_constraints": con_linking_pred,
+                    "block_assignments": con_block_pred,
+                },
+                # Auxiliary: variable DBSCAN + GNN classifier
+                "variable_clusters": {
+                    "master_problem": sorted(master_problem),
+                    "subproblems": ordered_subproblems,
+                },
+                "classifier_prediction": con_pred,
                 "stats": {
-                    "num_subproblems": len(ordered_subproblems),
+                    "num_con_blocks": len(set(v for v in con_block_pred.values())),
+                    "num_con_linking": len(con_linking_pred),
+                    "num_var_subproblems": len(ordered_subproblems),
                     "num_master_vars": len(master_problem),
                     "total_vars": len(final_labels),
                     "num_assigned_jobs": len(assignment),

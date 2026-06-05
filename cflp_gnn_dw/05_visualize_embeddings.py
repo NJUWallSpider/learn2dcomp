@@ -52,7 +52,7 @@ def visualize_embeddings():
 
     # Inference
     with torch.no_grad():
-        var_emb, _, _ = model(data)
+        var_emb, _, _, _ = model(data)
         embeddings = var_emb.cpu().numpy()
         labels = data['variable'].y.cpu().numpy()
 
